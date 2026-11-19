@@ -1,0 +1,93 @@
+import os
+import json
+import numpy as np
+import pandas as pd
+import requests
+
+TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
+STATE_FILE = "last_alert.json"
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+
+def send_tg(text: str):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
+
+def load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"last_ts": {}}
+
+def save_state(st: dict):
+    with open(STATE_FILE, "w") as f:
+        json.dump(st, f, indent=2)
+
+def fetch_klines(symbol: str, interval: str, limit: int = 80) -> pd.DataFrame:
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+    rows = requests.get(url, params=params, timeout=10).json()["result"]["list"]
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume", "turnover"])
+    df = df.iloc[::-1].reset_index(drop=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df
+
+def check_signal(symbol: str):
+    df_1h = fetch_klines(symbol, "60", 80)
+    ema20_1h = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-2]
+    ema50_1h = df_1h["close"].ewm(span=50, adjust=False).mean().iloc[-2]
+    htf_trend = "LONG (매수)" if ema20_1h > ema50_1h else "SHORT (매도)"
+
+    df_5m = fetch_klines(symbol, "5", 80)
+    candle_ts = str(df_5m["ts"].iloc[-2])
+    high, low, close = df_5m["high"], df_5m["low"], df_5m["close"]
+
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    plus_dm[plus_dm < minus_dm] = 0
+    minus_dm[minus_dm < plus_dm] = 0
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/14, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0)
+    adx_val = float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-2])
+
+    mid = close.rolling(20).mean().iloc[-2]
+    std = close.rolling(20).std().iloc[-2]
+    bbw = (4 * std) / mid if mid > 0 else 0
+
+    if adx_val < 22.0 or bbw < 0.0045:
+        return None, candle_ts
+
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    price = float(close.iloc[-1])
+
+    if htf_trend.startswith("LONG") and ema9.iloc[-2] > ema21.iloc[-2] and ema9.iloc[-3] <= ema21.iloc[-3] and close.iloc[-2] > ema9.iloc[-2]:
+        return ("LONG (매수)", price, round(price * 1.012, 2), round(price * 0.9905, 2), adx_val), candle_ts
+    if htf_trend.startswith("SHORT") and ema9.iloc[-2] < ema21.iloc[-2] and ema9.iloc[-3] >= ema21.iloc[-3] and close.iloc[-2] < ema9.iloc[-2]:
+        return ("SHORT (매도)", price, round(price * 0.988, 2), round(price * 1.0095, 2), adx_val), candle_ts
+
+    return None, candle_ts
+
+def main():
+    st = load_state()
+    for sym in SYMBOLS:
+        res, ts = check_signal(sym)
+        if res and st["last_ts"].get(sym) != ts:
+            side, entry, tp, sl, adx_val = res
+            st["last_ts"][sym] = ts
+            send_tg(
+                f"🚨 [{sym}] 추세 돌파 시그널 발생!\n"
+                f"• 방향: {side}\n"
+                f"• 현재가(진입): ${entry:,.2f}\n"
+                f"• 목표 익절(TP): ${tp:,.2f} (+1.2%)\n"
+                f"• 기준 손절(SL): ${sl:,.2f} (-0.95%)\n"
+                f"• 추세 강도(ADX): {adx_val:.1f}"
+            )
+    save_state(st)
+
+if __name__ == "__main__":
+    main()
