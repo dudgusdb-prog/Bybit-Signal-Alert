@@ -7,7 +7,7 @@ import requests
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 STATE_FILE = "last_alert.json"
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT"]
 
 def send_tg(text: str):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -26,7 +26,7 @@ def save_state(st: dict):
 
 def fetch_klines(symbol: str, interval: str, limit: int = 80) -> pd.DataFrame:
     headers = {"User-Agent": "Mozilla/5.0"}
-    # 1순위: OKX 무기한 선물 공개 API (미국 GitHub 서버 차단 없음)
+    # 1순위: OKX 무기한 선물 공개 API
     inst_id = f"{symbol.replace('USDT', '')}-USDT-SWAP"
     bar = "1H" if interval == "60" else f"{interval}m"
     try:
@@ -65,6 +65,11 @@ def fetch_klines(symbol: str, interval: str, limit: int = 80) -> pd.DataFrame:
         df[col] = df[col].astype(float)
     return df
 
+def format_price(symbol: str, price: float) -> str:
+    if symbol == "ADAUSDT":
+        return f"${price:,.4f}"
+    return f"${price:,.2f}"
+
 def check_signal(symbol: str):
     df_1h = fetch_klines(symbol, "60", 80)
     ema20_1h = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-2]
@@ -92,18 +97,18 @@ def check_signal(symbol: str):
     std = close.rolling(20).std().iloc[-2]
     bbw = (4 * std) / mid if mid > 0 else 0
 
-    # 횡보장 필터
     if adx_val < 22.0 or bbw < 0.0045:
         return None, candle_ts
 
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     price = float(close.iloc[-1])
+    dec = 4 if symbol == "ADAUSDT" else 2
 
     if htf_trend.startswith("LONG") and ema9.iloc[-2] > ema21.iloc[-2] and ema9.iloc[-3] <= ema21.iloc[-3] and close.iloc[-2] > ema9.iloc[-2]:
-        return ("LONG (매수)", price, round(price * 1.012, 2), round(price * 0.9905, 2), adx_val), candle_ts
+        return ("LONG (매수)", price, round(price * 1.012, dec), round(price * 0.9905, dec), adx_val), candle_ts
     if htf_trend.startswith("SHORT") and ema9.iloc[-2] < ema21.iloc[-2] and ema9.iloc[-3] >= ema21.iloc[-3] and close.iloc[-2] < ema9.iloc[-2]:
-        return ("SHORT (매도)", price, round(price * 0.988, 2), round(price * 1.0095, 2), adx_val), candle_ts
+        return ("SHORT (매도)", price, round(price * 0.988, dec), round(price * 1.0095, dec), adx_val), candle_ts
 
     return None, candle_ts
 
@@ -119,15 +124,14 @@ def main():
             send_tg(
                 f"🚨 [{sym}] 추세 돌파 시그널 발생!\n"
                 f"• 방향: {side}\n"
-                f"• 현재가(진입): ${entry:,.2f}\n"
-                f"• 목표 익절(TP): ${tp:,.2f} (+1.2%)\n"
-                f"• 기준 손절(SL): ${sl:,.2f} (-0.95%)\n"
+                f"• 현재가(진입): {format_price(sym, entry)}\n"
+                f"• 목표 익절(TP): {format_price(sym, tp)} (+1.2%)\n"
+                f"• 기준 손절(SL): {format_price(sym, sl)} (-0.95%)\n"
                 f"• 추세 강도(ADX): {adx_val:.1f}"
             )
 
-    # 수동 실행(Run workflow)일 때만 텔레그램 연결 테스트 메시지 발송
     if not sent_any and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        send_tg("✅ 시그널 봇 연결 정상! (현재는 횡보장이라 진입 타점 없음)")
+        send_tg("✅ 4종목(BTC·ETH·SOL·ADA) 시그널 봇 연결 정상! (현재는 횡보장이라 진입 타점 없음)")
 
     save_state(st)
 
