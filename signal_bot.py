@@ -11,7 +11,8 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 
 def send_tg(text: str):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
+    resp = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=10)
+    resp.raise_for_status()
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
@@ -24,10 +25,41 @@ def save_state(st: dict):
         json.dump(st, f, indent=2)
 
 def fetch_klines(symbol: str, interval: str, limit: int = 80) -> pd.DataFrame:
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-    rows = requests.get(url, params=params, timeout=10).json()["result"]["list"]
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume", "turnover"])
+    headers = {"User-Agent": "Mozilla/5.0"}
+    # 1순위: OKX 무기한 선물 공개 API (미국 GitHub 서버 차단 없음)
+    inst_id = f"{symbol.replace('USDT', '')}-USDT-SWAP"
+    bar = "1H" if interval == "60" else f"{interval}m"
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": inst_id, "bar": bar, "limit": limit},
+            headers=headers,
+            timeout=10
+        )
+        data = r.json()
+        if r.status_code == 200 and data.get("code") == "0":
+            rows = data["data"]
+            df = pd.DataFrame(rows).iloc[:, :6]
+            df.columns = ["ts", "open", "high", "low", "close", "volume"]
+            df = df.iloc[::-1].reset_index(drop=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            return df
+    except Exception:
+        pass
+
+    # 2순위: Coinbase 공개 캔들 API (백업)
+    product_id = f"{symbol.replace('USDT', '')}-USD"
+    granularity = 3600 if interval == "60" else int(interval) * 60
+    r = requests.get(
+        f"https://api.exchange.coinbase.com/products/{product_id}/candles",
+        params={"granularity": granularity},
+        headers=headers,
+        timeout=10
+    )
+    r.raise_for_status()
+    rows = r.json()[:limit]
+    df = pd.DataFrame(rows, columns=["ts", "low", "high", "open", "close", "volume"])
     df = df.iloc[::-1].reset_index(drop=True)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
