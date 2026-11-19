@@ -75,6 +75,7 @@ def check_signal(symbol: str):
     candle_ts = str(df_5m["ts"].iloc[-2])
     high, low, close = df_5m["high"], df_5m["low"], df_5m["close"]
 
+    # ADX(14) 계산
     plus_dm = high.diff().clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
     plus_dm[plus_dm < minus_dm] = 0
@@ -86,10 +87,12 @@ def check_signal(symbol: str):
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], 0).fillna(0)
     adx_val = float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-2])
 
+    # BBW(20) 계산
     mid = close.rolling(20).mean().iloc[-2]
     std = close.rolling(20).std().iloc[-2]
     bbw = (4 * std) / mid if mid > 0 else 0
 
+    # 횡보장 필터
     if adx_val < 22.0 or bbw < 0.0045:
         return None, candle_ts
 
@@ -106,11 +109,13 @@ def check_signal(symbol: str):
 
 def main():
     st = load_state()
+    sent_any = False
     for sym in SYMBOLS:
         res, ts = check_signal(sym)
         if res and st["last_ts"].get(sym) != ts:
             side, entry, tp, sl, adx_val = res
             st["last_ts"][sym] = ts
+            sent_any = True
             send_tg(
                 f"🚨 [{sym}] 추세 돌파 시그널 발생!\n"
                 f"• 방향: {side}\n"
@@ -119,6 +124,11 @@ def main():
                 f"• 기준 손절(SL): ${sl:,.2f} (-0.95%)\n"
                 f"• 추세 강도(ADX): {adx_val:.1f}"
             )
+
+    # 수동 실행(Run workflow)일 때만 텔레그램 연결 테스트 메시지 발송
+    if not sent_any and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        send_tg("✅ 시그널 봇 연결 정상! (현재는 횡보장이라 진입 타점 없음)")
+
     save_state(st)
 
 if __name__ == "__main__":
