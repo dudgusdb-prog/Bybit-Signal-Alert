@@ -73,18 +73,17 @@ def format_price(symbol: str, price: float) -> str:
     return f"${price:,.2f}"
 
 def track_active_position(st: dict) -> bool:
-    """보유 중인 포지션이 있으면 TP/SL 터치 여부를 확인하고 종료 시 알림 발송"""
+    """보유 중인 가상 포지션이 있으면 TP/SL 터치 여부를 확인하고 종료 시 알림 발송"""
     pos = st.get("active_pos")
     if not pos:
         return False
 
     sym = pos["symbol"]
-    df_5m = fetch_klines(sym, "5", 20)
-    # 진입 시점 이후 발생한 봉들의 고가·저가 확인
+    df_5m = fetch_klines(sym, "5", 30)
     entry_ts = int(pos["ts"])
     recent = df_5m[df_5m["ts"].astype(np.int64) > entry_ts]
     if recent.empty:
-        return True  # 아직 진입 봉 진행 중
+        return True
 
     max_high = float(recent["high"].max())
     min_low = float(recent["low"].min())
@@ -94,7 +93,6 @@ def track_active_position(st: dict) -> bool:
     hit_sl = (min_low <= pos["sl"]) if is_long else (max_high >= pos["sl"])
 
     if hit_sl or hit_tp:
-        # 보수적 판정: 동시 터치 시 손절 우선
         if hit_sl:
             st["consec_losses"] += 1
             next_weight = "10% (2연패 방어 모드)" if st["consec_losses"] >= 2 else "20% (기본 비중)"
@@ -114,9 +112,9 @@ def track_active_position(st: dict) -> bool:
                 f"• 연패 초기화 완료 (다음 권장 비중: 시드의 20%)"
             )
         st["active_pos"] = None
-        return False  # 포지션 종료됨 -> 새 시그널 탐색 가능
+        return False
 
-    return True  # 아직 포지션 보유 중 -> 중복 진입 차단
+    return True
 
 def check_signal(symbol: str):
     df_1h = fetch_klines(symbol, "60", 80)
@@ -151,9 +149,21 @@ def check_signal(symbol: str):
     price = float(close.iloc[-1])
     dec = 4 if symbol == "ADAUSDT" else 2
 
-    if htf_trend.startswith("LONG") and ema9.iloc[-2] > ema21.iloc[-2] and ema9.iloc[-3] <= ema21.iloc[-3] and close.iloc[-2] > ema9.iloc[-2]:
+    # 최근 3개 마감 봉(-2, -3, -4) 이내에 골든/데드크로스가 발생했는지 확인
+    recent_gold = (
+        (ema9.iloc[-2] > ema21.iloc[-2] and ema9.iloc[-3] <= ema21.iloc[-3]) or
+        (ema9.iloc[-3] > ema21.iloc[-3] and ema9.iloc[-4] <= ema21.iloc[-4]) or
+        (ema9.iloc[-4] > ema21.iloc[-4] and ema9.iloc[-5] <= ema21.iloc[-5])
+    )
+    recent_dead = (
+        (ema9.iloc[-2] < ema21.iloc[-2] and ema9.iloc[-3] >= ema21.iloc[-3]) or
+        (ema9.iloc[-3] < ema21.iloc[-3] and ema9.iloc[-4] >= ema21.iloc[-4]) or
+        (ema9.iloc[-4] < ema21.iloc[-4] and ema9.iloc[-5] >= ema21.iloc[-5])
+    )
+
+    if htf_trend.startswith("LONG") and ema9.iloc[-2] > ema21.iloc[-2] and recent_gold and close.iloc[-2] > ema9.iloc[-2]:
         return ("LONG (매수)", price, round(price * 1.012, dec), round(price * 0.9905, dec), adx_val), candle_ts
-    if htf_trend.startswith("SHORT") and ema9.iloc[-2] < ema21.iloc[-2] and ema9.iloc[-3] >= ema21.iloc[-3] and close.iloc[-2] < ema9.iloc[-2]:
+    if htf_trend.startswith("SHORT") and ema9.iloc[-2] < ema21.iloc[-2] and recent_dead and close.iloc[-2] < ema9.iloc[-2]:
         return ("SHORT (매도)", price, round(price * 0.988, dec), round(price * 1.0095, dec), adx_val), candle_ts
 
     return None, candle_ts
@@ -186,7 +196,6 @@ def main():
         for c in candidates:
             st["last_ts"][c["symbol"]] = c["ts"]
 
-        # 신규 포지션 상태 기록 (다음 실행부터 TP/SL 추적 시작)
         st["active_pos"] = {
             "symbol": best["symbol"], "ts": best["ts"], "side": best["side"],
             "entry": best["entry"], "tp": best["tp"], "sl": best["sl"]
@@ -204,7 +213,14 @@ def main():
             f"• 권장 진입 비중: 시드의 {weight_txt}"
         )
     elif os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        send_tg("✅ 4종목 시그널 봇 연결 정상! (현재 무포지션 · 횡보 대기 중)")
+        status_lines = []
+        for sym in SYMBOLS:
+            df_1h = fetch_klines(sym, "60", 80)
+            e20 = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-2]
+            e50 = df_1h["close"].ewm(span=50, adjust=False).mean().iloc[-2]
+            trend = "상승(LONG대기)" if e20 > e50 else "하락(SHORT대기)"
+            status_lines.append(f"• {sym}: {trend}")
+        send_tg("✅ 4종목 시그널 봇 정상 (무포지션)\n" + "\n".join(status_lines))
 
     save_state(st)
 
