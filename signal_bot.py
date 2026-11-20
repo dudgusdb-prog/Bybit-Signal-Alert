@@ -17,8 +17,12 @@ def send_tg(text: str):
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"last_ts": {}}
+            st = json.load(f)
+            st.setdefault("last_ts", {})
+            st.setdefault("active_pos", None)
+            st.setdefault("consec_losses", 0)
+            return st
+    return {"last_ts": {}, "active_pos": None, "consec_losses": 0}
 
 def save_state(st: dict):
     with open(STATE_FILE, "w") as f:
@@ -68,6 +72,52 @@ def format_price(symbol: str, price: float) -> str:
         return f"${price:,.4f}"
     return f"${price:,.2f}"
 
+def track_active_position(st: dict) -> bool:
+    """보유 중인 포지션이 있으면 TP/SL 터치 여부를 확인하고 종료 시 알림 발송"""
+    pos = st.get("active_pos")
+    if not pos:
+        return False
+
+    sym = pos["symbol"]
+    df_5m = fetch_klines(sym, "5", 20)
+    # 진입 시점 이후 발생한 봉들의 고가·저가 확인
+    entry_ts = int(pos["ts"])
+    recent = df_5m[df_5m["ts"].astype(np.int64) > entry_ts]
+    if recent.empty:
+        return True  # 아직 진입 봉 진행 중
+
+    max_high = float(recent["high"].max())
+    min_low = float(recent["low"].min())
+    is_long = pos["side"].startswith("LONG")
+
+    hit_tp = (max_high >= pos["tp"]) if is_long else (min_low <= pos["tp"])
+    hit_sl = (min_low <= pos["sl"]) if is_long else (max_high >= pos["sl"])
+
+    if hit_sl or hit_tp:
+        # 보수적 판정: 동시 터치 시 손절 우선
+        if hit_sl:
+            st["consec_losses"] += 1
+            next_weight = "10% (2연패 방어 모드)" if st["consec_losses"] >= 2 else "20% (기본 비중)"
+            send_tg(
+                f"🛑 [{sym}] 기준 손절(SL) 도달!\n"
+                f"• 방향: {pos['side']}\n"
+                f"• 진입가: {format_price(sym, pos['entry'])} → 손절가: {format_price(sym, pos['sl'])} (-0.95%)\n"
+                f"• 현재 누적 연패: {st['consec_losses']}연패\n"
+                f"• 다음 시그널 권장 비중: 시드의 {next_weight}"
+            )
+        else:
+            st["consec_losses"] = 0
+            send_tg(
+                f"🎯 [{sym}] 목표 익절(TP) 도달!\n"
+                f"• 방향: {pos['side']}\n"
+                f"• 진입가: {format_price(sym, pos['entry'])} → 익절가: {format_price(sym, pos['tp'])} (+1.2%)\n"
+                f"• 연패 초기화 완료 (다음 권장 비중: 시드의 20%)"
+            )
+        st["active_pos"] = None
+        return False  # 포지션 종료됨 -> 새 시그널 탐색 가능
+
+    return True  # 아직 포지션 보유 중 -> 중복 진입 차단
+
 def check_signal(symbol: str):
     df_1h = fetch_klines(symbol, "60", 80)
     ema20_1h = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-2]
@@ -110,40 +160,51 @@ def check_signal(symbol: str):
 
 def main():
     st = load_state()
-    candidates = []
 
-    # 1. 4종목 전체 스캔 후 유효한 신규 시그널 후보 수집
+    # 1. 기존 포지션이 살아있으면 청산 여부부터 추적하고, 미청산 시 신규 알림 차단
+    still_open = track_active_position(st)
+    if still_open:
+        if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+            pos = st["active_pos"]
+            send_tg(f"⏳ 현재 [{pos['symbol']}] {pos['side']} 포지션 추적 중 (진입: {format_price(pos['symbol'], pos['entry'])})")
+        save_state(st)
+        return
+
+    # 2. 무포지션 상태일 때만 4종목 신규 스캔
+    candidates = []
     for sym in SYMBOLS:
         res, ts = check_signal(sym)
         if res and st["last_ts"].get(sym) != ts:
             side, entry, tp, sl, adx_val = res
             candidates.append({
-                "symbol": sym,
-                "ts": ts,
-                "side": side,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "adx": adx_val
+                "symbol": sym, "ts": ts, "side": side,
+                "entry": entry, "tp": tp, "sl": sl, "adx": adx_val
             })
 
-    # 2. 후보 중 ADX(추세 강도)가 가장 높은 단 1종목만 선택해 발송
     if candidates:
         best = max(candidates, key=lambda x: x["adx"])
         for c in candidates:
             st["last_ts"][c["symbol"]] = c["ts"]
 
+        # 신규 포지션 상태 기록 (다음 실행부터 TP/SL 추적 시작)
+        st["active_pos"] = {
+            "symbol": best["symbol"], "ts": best["ts"], "side": best["side"],
+            "entry": best["entry"], "tp": best["tp"], "sl": best["sl"]
+        }
+
         sym = best["symbol"]
+        weight_txt = "10% (2연패 방어 모드)" if st["consec_losses"] >= 2 else "20% (기본 비중)"
         send_tg(
             f"🚨 [{sym}] 최우선 추세 돌파 시그널! (후보 {len(candidates)}개 중 ADX 1위)\n"
             f"• 방향: {best['side']}\n"
             f"• 현재가(진입): {format_price(sym, best['entry'])}\n"
             f"• 목표 익절(TP): {format_price(sym, best['tp'])} (+1.2%)\n"
             f"• 기준 손절(SL): {format_price(sym, best['sl'])} (-0.95%)\n"
-            f"• 추세 강도(ADX): {best['adx']:.1f}"
+            f"• 추세 강도(ADX): {best['adx']:.1f}\n"
+            f"• 권장 진입 비중: 시드의 {weight_txt}"
         )
     elif os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        send_tg("✅ 4종목(BTC·ETH·SOL·ADA) 시그널 봇 연결 정상! (현재는 횡보장이라 진입 타점 없음)")
+        send_tg("✅ 4종목 시그널 봇 연결 정상! (현재 무포지션 · 횡보 대기 중)")
 
     save_state(st)
 
