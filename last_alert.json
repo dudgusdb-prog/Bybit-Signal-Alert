@@ -1,5 +1,7 @@
 {
   "last_ts": {
     "SOLUSDT": "1795127400000"
-  }
+  },
+  "active_pos": null,
+  "consec_losses": 0
 }
