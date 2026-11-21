@@ -2,13 +2,6 @@
   "last_ts": {
     "SOLUSDT": "1795249800000"
   },
-  "active_pos": {
-    "symbol": "SOLUSDT",
-    "ts": "1795249800000",
-    "side": "SHORT (\ub9e4\ub3c4)",
-    "entry": 66.74,
-    "tp": 65.94,
-    "sl": 67.37
-  },
-  "consec_losses": 0
+  "active_pos": null,
+  "consec_losses": 1
 }
