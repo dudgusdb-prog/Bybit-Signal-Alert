@@ -3,13 +3,6 @@
     "SOLUSDT": "1795249800000",
     "BTCUSDT": "1795275900000"
   },
-  "active_pos": {
-    "symbol": "BTCUSDT",
-    "ts": "1795275900000",
-    "side": "SHORT (\ub9e4\ub3c4)",
-    "entry": 60005.9,
-    "tp": 59285.83,
-    "sl": 60575.96
-  },
-  "consec_losses": 1
+  "active_pos": null,
+  "consec_losses": 0
 }
