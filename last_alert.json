@@ -1,8 +1,16 @@
 {
   "last_ts": {
     "SOLUSDT": "1795249800000",
-    "BTCUSDT": "1795275900000"
+    "BTCUSDT": "1795275900000",
+    "ADAUSDT": "1795368000000"
   },
-  "active_pos": null,
+  "active_pos": {
+    "symbol": "ADAUSDT",
+    "ts": "1795368000000",
+    "side": "SHORT (\ub9e4\ub3c4)",
+    "entry": 0.1446,
+    "tp": 0.1429,
+    "sl": 0.146
+  },
   "consec_losses": 0
 }
