@@ -13,7 +13,7 @@ SYMBOLS = {
 }
 DAYS = 90
 MARGIN_RATIO = 0.25
-FEE_RATE = 0.0002  # 지정가(Maker) 편도 0.02%
+FEE_RATE = 0.0002  # 바이비트 지정가(Maker) 편도 0.02%
 
 
 def fetch_15m_ohlcv(exchange, symbol, days=90):
@@ -37,12 +37,17 @@ def fetch_15m_ohlcv(exchange, symbol, days=90):
 
 
 def add_indicators(df):
-    # 15분봉 지표
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["prev_low"] = df["low"].shift(1)
+    # 15분봉 볼린저밴드(20, 2)
+    df["bb_mid"] = df["close"].rolling(20).mean()
+    bb_std = df["close"].rolling(20).std()
+    df["bb_upper"] = df["bb_mid"] + 2.0 * bb_std
+    df["bb_lower"] = df["bb_mid"] - 2.0 * bb_std
+    df["prev_bb_upper"] = df["bb_upper"].shift(1)
+    df["prev_bb_lower"] = df["bb_lower"].shift(1)
     df["prev_high"] = df["high"].shift(1)
-    df["prev_close"] = df["close"].shift(1)
+    df["prev_low"] = df["low"].shift(1)
 
+    # 15분봉 RSI(14)
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
@@ -50,6 +55,7 @@ def add_indicators(df):
     df["rsi14"] = 100 - (100 / (1 + rs))
     df["prev_rsi"] = df["rsi14"].shift(1)
 
+    # 15분봉 ATR(14)
     tr15 = pd.concat(
         [
             df["high"] - df["low"],
@@ -61,7 +67,7 @@ def add_indicators(df):
     df["atr14"] = tr15.ewm(alpha=1 / 14, adjust=False).mean()
     df["atr_pct"] = df["atr14"] / df["close"]
 
-    # 1시간봉 추세 + ADX (미래 참조 방지 1봉 시프트)
+    # 1시간봉 추세 필터 (미래 참조 방지 1봉 시프트)
     df_1h = (
         df.set_index("dt")
         .resample("1h")
@@ -96,11 +102,11 @@ def add_indicators(df):
         .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
         .dropna()
     )
-    df_4h["ema20_4h"] = df_4h["close"].ewm(span=20, adjust=False).mean()
+    df_4h["close_4h"] = df_4h["close"]
     df_4h["ema50_4h"] = df_4h["close"].ewm(span=50, adjust=False).mean()
 
     df_1h_s = df_1h[["ema20_1h", "ema50_1h", "adx14_1h"]].shift(1).reset_index()
-    df_4h_s = df_4h[["ema20_4h", "ema50_4h"]].shift(1).reset_index()
+    df_4h_s = df_4h[["close_4h", "ema50_4h"]].shift(1).reset_index()
 
     df = pd.merge_asof(df.sort_values("dt"), df_1h_s.sort_values("dt"), on="dt", direction="backward")
     df = pd.merge_asof(df.sort_values("dt"), df_4h_s.sort_values("dt"), on="dt", direction="backward")
@@ -133,131 +139,66 @@ def run_backtest(df, symbol, leverage):
             side = pos["side"]
             entry = pos["entry"]
             sl = pos["sl"]
+            tp = pos["tp"]
             notional = pos["margin"] * leverage
-            closed = False
+            exit_price = None
 
             if side == "LONG":
-                # 1) 손절 체크
                 if row["low"] <= sl:
-                    rem = 0.4 if pos["tp1_done"] else 1.0
-                    gross = notional * rem * ((sl - entry) / entry)
-                    fee = notional * rem * FEE_RATE
-                    equity += gross - fee
-                    net_pnl = pos["realized_pnl"] + gross - fee
-                    trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
-                    consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
-                    pos = None
-                    closed = True
-                else:
-                    # 2) 1차 익절 (1.8 ATR, 60% 물량) + 본절 이동
-                    if not pos["tp1_done"] and row["high"] >= pos["tp1"]:
-                        gross = notional * 0.6 * ((pos["tp1"] - entry) / entry)
-                        fee = notional * 0.6 * FEE_RATE
-                        equity += gross - fee
-                        pos["realized_pnl"] += gross - fee
-                        pos["tp1_done"] = True
-                        pos["sl"] = entry * (1 + FEE_RATE * 2)
-
-                    # 3) 2차 익절 (3.6 ATR 또는 8시간 경과)
-                    if pos is not None and pos["tp1_done"]:
-                        if row["high"] >= pos["tp2"] or pos["bars"] >= 32:
-                            exit_p = pos["tp2"] if row["high"] >= pos["tp2"] else row["close"]
-                            gross = notional * 0.4 * ((exit_p - entry) / entry)
-                            fee = notional * 0.4 * FEE_RATE
-                            equity += gross - fee
-                            net_pnl = pos["realized_pnl"] + gross - fee
-                            trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
-                            consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
-                            pos = None
-                            closed = True
-                    elif pos is not None and pos["bars"] >= 32:
-                        gross = notional * ((row["close"] - entry) / entry)
-                        fee = notional * FEE_RATE
-                        equity += gross - fee
-                        net_pnl = pos["realized_pnl"] + gross - fee
-                        trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
-                        consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
-                        pos = None
-                        closed = True
-
-            else:  # SHORT
+                    exit_price = sl
+                elif row["high"] >= tp:
+                    exit_price = tp
+                elif pos["bars"] >= 48:  # 최대 12시간 보유
+                    exit_price = row["close"]
+            else:
                 if row["high"] >= sl:
-                    rem = 0.4 if pos["tp1_done"] else 1.0
-                    gross = notional * rem * ((entry - sl) / entry)
-                    fee = notional * rem * FEE_RATE
-                    equity += gross - fee
-                    net_pnl = pos["realized_pnl"] + gross - fee
-                    trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
-                    consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
-                    pos = None
-                    closed = True
-                else:
-                    if not pos["tp1_done"] and row["low"] <= pos["tp1"]:
-                        gross = notional * 0.6 * ((entry - pos["tp1"]) / entry)
-                        fee = notional * 0.6 * FEE_RATE
-                        equity += gross - fee
-                        pos["realized_pnl"] += gross - fee
-                        pos["tp1_done"] = True
-                        pos["sl"] = entry * (1 - FEE_RATE * 2)
+                    exit_price = sl
+                elif row["low"] <= tp:
+                    exit_price = tp
+                elif pos["bars"] >= 48:
+                    exit_price = row["close"]
 
-                    if pos is not None and pos["tp1_done"]:
-                        if row["low"] <= pos["tp2"] or pos["bars"] >= 32:
-                            exit_p = pos["tp2"] if row["low"] <= pos["tp2"] else row["close"]
-                            gross = notional * 0.4 * ((entry - exit_p) / entry)
-                            fee = notional * 0.4 * FEE_RATE
-                            equity += gross - fee
-                            net_pnl = pos["realized_pnl"] + gross - fee
-                            trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
-                            consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
-                            pos = None
-                            closed = True
-                    elif pos is not None and pos["bars"] >= 32:
-                        gross = notional * ((entry - row["close"]) / entry)
-                        fee = notional * FEE_RATE
-                        equity += gross - fee
-                        net_pnl = pos["realized_pnl"] + gross - fee
-                        trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
-                        consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
-                        pos = None
-                        closed = True
+            if exit_price is not None:
+                pnl_pct = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+                gross_pnl = notional * pnl_pct
+                exit_fee = notional * FEE_RATE
+                net_pnl = gross_pnl - exit_fee - pos["entry_fee"]
+                equity += gross_pnl - exit_fee
 
-            if closed:
+                trades.append({"symbol": symbol, "dt": row["dt"], "side": side, "pnl": net_pnl, "equity": equity})
+                consecutive_losses = consecutive_losses + 1 if net_pnl < 0 else 0
+                pos = None
+
                 peak_equity = max(peak_equity, equity)
                 max_dd = max(max_dd, (peak_equity - equity) / peak_equity * 100)
+
                 if (equity - day_start_equity) / day_start_equity >= 0.10 or consecutive_losses >= 2:
                     day_locked = True
 
         if pos is None and not day_locked and equity > 50:
-            if row["atr_pct"] < 0.0025:
+            if row["atr_pct"] < 0.0028:
                 continue
 
-            # 4시간봉 + 1시간봉 이중 정배열/역배열 + ADX >= 22
+            # 4시간봉 대추세 + 1시간봉 정배열/역배열 + ADX >= 20
             long_trend = (
-                (row["ema20_4h"] > row["ema50_4h"])
+                (row["close_4h"] > row["ema50_4h"])
                 and (row["ema20_1h"] > row["ema50_1h"])
-                and (row["adx14_1h"] >= 22)
+                and (row["adx14_1h"] >= 20)
             )
             short_trend = (
-                (row["ema20_4h"] < row["ema50_4h"])
+                (row["close_4h"] < row["ema50_4h"])
                 and (row["ema20_1h"] < row["ema50_1h"])
-                and (row["adx14_1h"] >= 22)
+                and (row["adx14_1h"] >= 20)
             )
 
-            # EMA20 눌림 후 RSI 반전 + 직전 고점(저점) 돌파 확인 캔들
-            long_sig = (
-                long_trend
-                and (row["prev_low"] <= row["ema20"])
-                and (row["prev_rsi"] <= 45)
-                and (row["rsi14"] > row["prev_rsi"])
-                and (row["close"] > row["prev_high"])
-            )
-            short_sig = (
-                short_trend
-                and (row["prev_high"] >= row["ema20"])
-                and (row["prev_rsi"] >= 55)
-                and (row["rsi14"] < row["prev_rsi"])
-                and (row["close"] < row["prev_low"])
-            )
+            # 볼린저밴드 외곽 터치 후 RSI 과매도/과매수 반전 양봉(음봉)
+            long_touch = (row["low"] <= row["bb_lower"]) or (row["prev_low"] <= row["prev_bb_lower"])
+            long_rsi = ((row["rsi14"] <= 38) or (row["prev_rsi"] <= 36)) and (row["rsi14"] > row["prev_rsi"])
+            long_sig = long_trend and long_touch and long_rsi and (row["close"] > row["open"])
+
+            short_touch = (row["high"] >= row["bb_upper"]) or (row["prev_high"] >= row["prev_bb_upper"])
+            short_rsi = ((row["rsi14"] >= 62) or (row["prev_rsi"] >= 64)) and (row["rsi14"] < row["prev_rsi"])
+            short_sig = short_trend and short_touch and short_rsi and (row["close"] < row["open"])
 
             if long_sig or short_sig:
                 side = "LONG" if long_sig else "SHORT"
@@ -267,24 +208,21 @@ def run_backtest(df, symbol, leverage):
                 entry_fee = margin * leverage * FEE_RATE
                 equity -= entry_fee
 
+                # 손익비 1 : 1.12 고정 (익절 2.8 ATR / 손절 2.5 ATR)
                 if side == "LONG":
-                    sl = entry - 2.2 * atr
-                    tp1 = entry + 1.8 * atr
-                    tp2 = entry + 3.6 * atr
+                    tp = entry + 2.8 * atr
+                    sl = entry - 2.5 * atr
                 else:
-                    sl = entry + 2.2 * atr
-                    tp1 = entry - 1.8 * atr
-                    tp2 = entry - 3.6 * atr
+                    tp = entry - 2.8 * atr
+                    sl = entry + 2.5 * atr
 
                 pos = {
                     "side": side,
                     "entry": entry,
                     "sl": sl,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "tp1_done": False,
+                    "tp": tp,
                     "margin": margin,
-                    "realized_pnl": -entry_fee,
+                    "entry_fee": entry_fee,
                     "bars": 0,
                 }
 
@@ -330,7 +268,7 @@ def main():
     if all_trades:
         pd.concat(all_trades, ignore_index=True).to_csv("backtest_trades.csv", index=False)
 
-    lines = [f"📊 이중추세+분할익절 백테스트 결과 ({DAYS}일)"]
+    lines = [f"📊 4H+1H 추세 눌림목 백테스트 결과 ({DAYS}일)"]
     for s in summaries:
         lines.append(
             f"- {s['symbol'].split('/')[0]}: 거래 {s['trades']}회 | 승률 {s['win_rate']}% | 누적 {s['ret_pct']}% | MDD {s['mdd_pct']}%"
