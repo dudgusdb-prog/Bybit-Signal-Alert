@@ -5,12 +5,8 @@ import ccxt
 import numpy as np
 import pandas as pd
 
-MAX_LEVERAGE = {
-    "BTC/USDT:USDT": 15,
-    "ETH/USDT:USDT": 15,
-    "SOL/USDT:USDT": 10,
-    "ADA/USDT:USDT": 10,
-}
+SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "ADA/USDT:USDT"]
+MAX_LEV = np.array([15.0, 15.0, 10.0, 10.0])
 DAYS = 90
 FEE_RATE = 0.0002  # 바이비트 지정가(Maker) 편도 0.02%
 
@@ -67,231 +63,267 @@ def calc_adx(df, period=14):
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def prepare_15m_and_1h(raw_df, btc_1h_ref, btc_4h_ref):
-    # 1시간봉 데이터 생성
-    df_1h = (
-        raw_df.set_index("dt")
-        .resample("1h")
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-        .dropna()
-    )
-    df_1h["ema20_1h"] = df_1h["close"].ewm(span=20, adjust=False).mean()
-    df_1h["ema50_1h"] = df_1h["close"].ewm(span=50, adjust=False).mean()
-    df_1h["adx14_1h"] = calc_adx(df_1h, 14)
-    df_1h["rsi14_1h"] = calc_rsi(df_1h["close"], 14)
-    df_1h["prev_rsi_1h"] = df_1h["rsi14_1h"].shift(1)
-    df_1h["atr14_1h"] = calc_atr(df_1h, 14)
-    df_1h["atr_pct_1h"] = df_1h["atr14_1h"] / df_1h["close"]
-    df_1h["prev_low_1h"] = df_1h["low"].shift(1)
-    df_1h["prev_high_1h"] = df_1h["high"].shift(1)
+def build_features(raw_data, tf="15m"):
+    # BTC 기준 상위 추세 생성
+    btc_raw = raw_data["BTC/USDT:USDT"]
+    btc_4h = btc_raw.set_index("dt").resample("4h").agg({"close": "last"}).dropna()
+    btc_4h["btc_c4"] = btc_4h["close"]
+    btc_4h["btc_e50_4"] = btc_4h["close"].ewm(span=50, adjust=False).mean()
+    btc_4h_ref = btc_4h[["btc_c4", "btc_e50_4"]].shift(1).reset_index()
 
-    # 4시간봉 데이터 생성
-    df_4h = (
-        raw_df.set_index("dt")
-        .resample("4h")
-        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-        .dropna()
-    )
-    df_4h["close_4h"] = df_4h["close"]
-    df_4h["ema50_4h"] = df_4h["close"].ewm(span=50, adjust=False).mean()
+    btc_1h = btc_raw.set_index("dt").resample("1h").agg({"close": "last"}).dropna()
+    btc_1h["btc_c1"] = btc_1h["close"]
+    btc_1h["btc_e20_1"] = btc_1h["close"].ewm(span=20, adjust=False).mean()
+    btc_1h_ref = btc_1h[["btc_c1", "btc_e20_1"]].shift(1).reset_index()
 
-    s_1h = df_1h[["close", "ema20_1h", "ema50_1h", "adx14_1h"]].rename(columns={"close": "close_1h"}).shift(1).reset_index()
-    s_4h = df_4h[["close_4h", "ema50_4h"]].shift(1).reset_index()
+    dfs = {}
+    for sym in SYMBOLS:
+        raw = raw_data[sym]
+        df_1h = (
+            raw.set_index("dt")
+            .resample("1h")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+            .dropna()
+        )
+        df_1h["e20_1"] = df_1h["close"].ewm(span=20, adjust=False).mean()
+        df_1h["e50_1"] = df_1h["close"].ewm(span=50, adjust=False).mean()
+        df_1h["adx_1"] = calc_adx(df_1h, 14)
 
-    # 15분봉 프레임 완성 (모델 A용)
-    df15 = raw_df.copy()
-    bb_mid = df15["close"].rolling(20).mean()
-    bb_std = df15["close"].rolling(20).std()
-    df15["bb_upper"] = bb_mid + 2.0 * bb_std
-    df15["bb_lower"] = bb_mid - 2.0 * bb_std
-    df15["prev_bb_upper"] = df15["bb_upper"].shift(1)
-    df15["prev_bb_lower"] = df15["bb_lower"].shift(1)
-    df15["prev_high"] = df15["high"].shift(1)
-    df15["prev_low"] = df15["low"].shift(1)
-    df15["rsi14"] = calc_rsi(df15["close"], 14)
-    df15["prev_rsi"] = df15["rsi14"].shift(1)
-    df15["atr14"] = calc_atr(df15, 14)
-    df15["atr_pct"] = df15["atr14"] / df15["close"]
+        df_4h = (
+            raw.set_index("dt")
+            .resample("4h")
+            .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+            .dropna()
+        )
+        df_4h["c4"] = df_4h["close"]
+        df_4h["e20_4"] = df_4h["close"].ewm(span=20, adjust=False).mean()
+        df_4h["e50_4"] = df_4h["close"].ewm(span=50, adjust=False).mean()
 
-    for ref in [s_1h, s_4h, btc_1h_ref, btc_4h_ref]:
-        df15 = pd.merge_asof(df15.sort_values("dt"), ref.sort_values("dt"), on="dt", direction="backward")
-    df15 = df15.dropna().reset_index(drop=True)
+        if tf == "15m":
+            df = raw.copy()
+            s_1h = df_1h[["e20_1", "e50_1", "adx_1"]].shift(1).reset_index()
+            s_4h = df_4h[["c4", "e20_4", "e50_4"]].shift(1).reset_index()
+            for ref in [s_1h, s_4h, btc_1h_ref, btc_4h_ref]:
+                df = pd.merge_asof(df.sort_values("dt"), ref.sort_values("dt"), on="dt", direction="backward")
+        else:
+            df = df_1h.reset_index()
+            s_4h = df_4h[["c4", "e20_4", "e50_4"]].shift(1).reset_index()
+            for ref in [s_4h, btc_1h_ref, btc_4h_ref]:
+                df = pd.merge_asof(df.sort_values("dt"), ref.sort_values("dt"), on="dt", direction="backward")
 
-    # 1시간봉 프레임 완성 (모델 B용)
-    df1h_exec = df_1h.reset_index()
-    df1h_exec = pd.merge_asof(df1h_exec.sort_values("dt"), s_4h.sort_values("dt"), on="dt", direction="backward")
-    df1h_exec = pd.merge_asof(df1h_exec.sort_values("dt"), btc_4h_ref.sort_values("dt"), on="dt", direction="backward")
-    df1h_exec = df1h_exec.dropna().reset_index(drop=True)
+        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        bb_mid = df["close"].rolling(20).mean()
+        bb_std = df["close"].rolling(20).std()
+        df["bb_u"] = bb_mid + 2.0 * bb_std
+        df["bb_l"] = bb_mid - 2.0 * bb_std
+        df["rsi"] = calc_rsi(df["close"], 14)
+        df["atr"] = calc_atr(df, 14)
+        df["atr_pct"] = df["atr"] / df["close"]
+        df["vol_ma"] = df["volume"].rolling(20).mean()
 
-    return df15, df1h_exec
+        # 스토캐스틱 RSI (빠른 반전 포착용)
+        rsi_min = df["rsi"].rolling(14).min()
+        rsi_max = df["rsi"].rolling(14).max()
+        df["stoch_k"] = ((df["rsi"] - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan) * 100).rolling(3).mean()
 
+        dfs[sym] = df.dropna().reset_index(drop=True)
 
-def sig_model_a(row):
-    # 모델 A: 5차 고승률 BB 외곽 반전 로직 (거래량/기울기 병목 제거)
-    if row["atr_pct"] < 0.0022:
-        return None
-    long_trend = (
-        (row["btc_close_4h"] > row["btc_ema50_4h"])
-        and (row["btc_close_1h"] > row["btc_ema20_1h"])
-        and (row["ema20_1h"] > row["ema50_1h"])
-        and (row["adx14_1h"] >= 20)
-    )
-    short_trend = (
-        (row["btc_close_4h"] < row["btc_ema50_4h"])
-        and (row["btc_close_1h"] < row["btc_ema20_1h"])
-        and (row["ema20_1h"] < row["ema50_1h"])
-        and (row["adx14_1h"] >= 20)
-    )
-
-    long_touch = (row["low"] <= row["bb_lower"]) or (row["prev_low"] <= row["prev_bb_lower"])
-    long_rsi = (row["prev_rsi"] <= 38) and (row["rsi14"] > row["prev_rsi"]) and (row["rsi14"] <= 48)
-    if long_trend and long_touch and long_rsi and (row["close"] > row["open"]):
-        return "LONG"
-
-    short_touch = (row["high"] >= row["bb_upper"]) or (row["prev_high"] >= row["prev_bb_upper"])
-    short_rsi = (row["prev_rsi"] >= 62) and (row["rsi14"] < row["prev_rsi"]) and (row["rsi14"] >= 52)
-    if short_trend and short_touch and short_rsi and (row["close"] < row["open"]):
-        return "SHORT"
-    return None
+    # 공통 타임라인 정렬
+    common_dts = sorted(set.intersection(*(set(dfs[s]["dt"]) for s in SYMBOLS)))
+    aligned = {s: dfs[s][dfs[s]["dt"].isin(common_dts)].sort_values("dt").reset_index(drop=True) for s in SYMBOLS}
+    return aligned, pd.Series(common_dts)
 
 
-def sig_model_b(row):
-    # 모델 B: 1시간봉 실행 스윙 추세 눌림목 (노이즈/수수료 최소화)
-    if row["atr_pct_1h"] < 0.004:
-        return None
-    long_trend = (
-        (row["btc_close_4h"] > row["btc_ema50_4h"])
-        and (row["close_4h"] > row["ema50_4h"])
-        and (row["ema20_1h"] > row["ema50_1h"])
-        and (row["adx14_1h"] >= 20)
-    )
-    short_trend = (
-        (row["btc_close_4h"] < row["btc_ema50_4h"])
-        and (row["close_4h"] < row["ema50_4h"])
-        and (row["ema20_1h"] < row["ema50_1h"])
-        and (row["adx14_1h"] >= 20)
-    )
+def generate_signal_sets(aligned, tf):
+    n = len(next(iter(aligned.values())))
+    presets = []
 
-    long_pull = (row["low"] <= row["ema20_1h"]) or (row["prev_low_1h"] <= row["ema20_1h"])
-    long_rsi = (row["prev_rsi_1h"] <= 43) and (row["rsi14_1h"] > row["prev_rsi_1h"])
-    if long_trend and long_pull and long_rsi and (row["close"] > row["open"]):
-        return "LONG"
+    trend_modes = ["BTC4H+Coin1H", "Strict_4H+1H", "Coin_Only"]
+    strat_modes = ["BB_Reversal", "EMA_StochRSI", "Keltner_Pullback"]
 
-    short_pull = (row["high"] >= row["ema20_1h"]) or (row["prev_high_1h"] >= row["ema20_1h"])
-    short_rsi = (row["prev_rsi_1h"] >= 57) and (row["rsi14_1h"] < row["prev_rsi_1h"])
-    if short_trend and short_pull and short_rsi and (row["close"] < row["open"]):
-        return "SHORT"
-    return None
+    for t_mode in trend_modes:
+        for s_mode in strat_modes:
+            sig_mat = np.zeros((n, 4), dtype=np.int8)
+            for c_idx, sym in enumerate(SYMBOLS):
+                df = aligned[sym]
+                min_atr = 0.0020 if tf == "15m" else 0.0038
+                vol_ok = df["atr_pct"] >= min_atr
+
+                if t_mode == "BTC4H+Coin1H":
+                    up_tr = (df["btc_c4"] > df["btc_e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 18)
+                    dn_tr = (df["btc_c4"] < df["btc_e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 18)
+                elif t_mode == "Strict_4H+1H":
+                    up_tr = (df["btc_c4"] > df["btc_e50_4"]) & (df["c4"] > df["e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 20)
+                    dn_tr = (df["btc_c4"] < df["btc_e50_4"]) & (df["c4"] < df["e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 20)
+                else:
+                    up_tr = (df["c4"] > df["e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 20)
+                    dn_tr = (df["c4"] < df["e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 20)
+
+                if s_mode == "BB_Reversal":
+                    touch_l = (df["low"] <= df["bb_l"]) | (df["low"].shift(1) <= df["bb_l"].shift(1))
+                    rsi_l = (df["rsi"].shift(1) <= 38) & (df["rsi"] > df["rsi"].shift(1))
+                    long_c = vol_ok & up_tr & touch_l & rsi_l & (df["close"] > df["open"])
+
+                    touch_s = (df["high"] >= df["bb_u"]) | (df["high"].shift(1) >= df["bb_u"].shift(1))
+                    rsi_s = (df["rsi"].shift(1) >= 62) & (df["rsi"] < df["rsi"].shift(1))
+                    short_c = vol_ok & dn_tr & touch_s & rsi_s & (df["close"] < df["open"])
+
+                elif s_mode == "EMA_StochRSI":
+                    pull_l = (df["low"] <= df["ema20"]) & (df["close"] > df["ema50"])
+                    st_l = (df["stoch_k"].shift(1) <= 25) & (df["stoch_k"] > df["stoch_k"].shift(1))
+                    long_c = vol_ok & up_tr & pull_l & st_l & (df["close"] > df["open"])
+
+                    pull_s = (df["high"] >= df["ema20"]) & (df["close"] < df["ema50"])
+                    st_s = (df["stoch_k"].shift(1) >= 75) & (df["stoch_k"] < df["stoch_k"].shift(1))
+                    short_c = vol_ok & dn_tr & pull_s & st_s & (df["close"] < df["open"])
+
+                else:  # Keltner_Pullback
+                    kc_l = df["ema20"] - 1.5 * df["atr"]
+                    kc_u = df["ema20"] + 1.5 * df["atr"]
+                    long_c = vol_ok & up_tr & (df["low"] <= kc_l) & (df["close"] > df["open"]) & (df["rsi"] < 48)
+                    short_c = vol_ok & dn_tr & (df["high"] >= kc_u) & (df["close"] < df["open"]) & (df["rsi"] > 52)
+
+                l_arr = long_c.fillna(False).to_numpy()
+                s_arr = short_c.fillna(False).to_numpy()
+                sig_mat[l_arr, c_idx] = 1
+                sig_mat[s_arr & (~l_arr), c_idx] = -1
+
+            presets.append((f"{tf}|{s_mode}|{t_mode}", sig_mat))
+    return presets
 
 
-def simulate_portfolio(dfs_by_sym, sig_fn, atr_col, sl_mult, tp_mult, max_bars, risk_per_trade):
+def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max_bars, risk_pct=0.055, record_trades=False):
+    n = len(close)
     equity = 1000.0
-    peak_equity = equity
+    peak = 1000.0
     max_dd = 0.0
-    positions = {}
-    trades = []
 
-    lookups = {sym: df.set_index("dt").to_dict("index") for sym, df in dfs_by_sym.items()}
-    all_dts = sorted(set().union(*(df["dt"].tolist() for df in dfs_by_sym.values())))
+    # 포지션 상태: active(bool), side(1/-1), entry, sl, tp, notional, entry_fee, bars
+    active = np.zeros(4, dtype=bool)
+    p_side = np.zeros(4, dtype=np.int8)
+    p_entry = np.zeros(4)
+    p_sl = np.zeros(4)
+    p_tp = np.zeros(4)
+    p_notional = np.zeros(4)
+    p_efee = np.zeros(4)
+    p_bars = np.zeros(4, dtype=np.int32)
 
-    current_day = None
-    day_start_equity = equity
+    cur_day = -1
+    day_start = 1000.0
     day_locked = False
 
-    for dt in all_dts:
-        day = dt.date()
-        if day != current_day:
-            current_day = day
-            day_start_equity = equity
+    wins = 0
+    losses = 0
+    gross_win = 0.0
+    gross_loss = 0.0
+    coin_wins = np.zeros(4, dtype=np.int32)
+    coin_losses = np.zeros(4, dtype=np.int32)
+    coin_pnl = np.zeros(4)
+    trade_logs = []
+
+    for t in range(n):
+        d = day_arr[t]
+        if d != cur_day:
+            cur_day = d
+            day_start = equity
             day_locked = False
 
-        for sym in list(positions.keys()):
-            row = lookups[sym].get(dt)
-            if row is None:
+        # 1) 보유 포지션 청산 체크
+        for c in range(4):
+            if not active[c]:
                 continue
-            pos = positions[sym]
-            pos["bars"] += 1
-            side = pos["side"]
-            entry = pos["entry"]
-            exit_price = None
-
-            if side == "LONG":
-                if row["low"] <= pos["sl"]:
-                    exit_price = pos["sl"]
-                elif row["high"] >= pos["tp"]:
-                    exit_price = pos["tp"]
-                elif pos["bars"] >= max_bars:
-                    exit_price = row["close"]
+            p_bars[c] += 1
+            s = p_side[c]
+            exit_p = 0.0
+            if s == 1:
+                if low[t, c] <= p_sl[c]:
+                    exit_p = p_sl[c]
+                elif high[t, c] >= p_tp[c]:
+                    exit_p = p_tp[c]
+                elif p_bars[c] >= max_bars:
+                    exit_p = close[t, c]
             else:
-                if row["high"] >= pos["sl"]:
-                    exit_price = pos["sl"]
-                elif row["low"] <= pos["tp"]:
-                    exit_price = pos["tp"]
-                elif pos["bars"] >= max_bars:
-                    exit_price = row["close"]
+                if high[t, c] >= p_sl[c]:
+                    exit_p = p_sl[c]
+                elif low[t, c] <= p_tp[c]:
+                    exit_p = p_tp[c]
+                elif p_bars[c] >= max_bars:
+                    exit_p = close[t, c]
 
-            if exit_price is not None:
-                pnl_pct = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
-                gross_pnl = pos["notional"] * pnl_pct
-                exit_fee = pos["notional"] * FEE_RATE
-                net_pnl = gross_pnl - exit_fee - pos["entry_fee"]
-                equity += gross_pnl - exit_fee
+            if exit_p > 0.0:
+                pnl_pct = (exit_p - p_entry[c]) / p_entry[c] if s == 1 else (p_entry[c] - exit_p) / p_entry[c]
+                gpnl = p_notional[c] * pnl_pct
+                xfee = p_notional[c] * FEE_RATE
+                net = gpnl - xfee - p_efee[c]
+                equity += gpnl - xfee
+                active[c] = False
 
-                trades.append({"symbol": sym, "dt": dt, "side": side, "pnl": net_pnl, "equity": equity})
-                del positions[sym]
+                coin_pnl[c] += net
+                if net > 0:
+                    wins += 1
+                    coin_wins[c] += 1
+                    gross_win += net
+                else:
+                    losses += 1
+                    coin_losses[c] += 1
+                    gross_loss += abs(net)
 
-                peak_equity = max(peak_equity, equity)
-                max_dd = max(max_dd, (peak_equity - equity) / peak_equity * 100)
+                if record_trades:
+                    trade_logs.append({"bar": t, "symbol": SYMBOLS[c], "side": "LONG" if s == 1 else "SHORT", "pnl": round(net, 2), "equity": round(equity, 2)})
 
-                day_ret = (equity - day_start_equity) / day_start_equity
-                if day_ret >= 0.12 or day_ret <= -0.08:
+                if equity > peak:
+                    peak = equity
+                dd = (peak - equity) / peak * 100.0
+                if dd > max_dd:
+                    max_dd = dd
+
+                d_ret = (equity - day_start) / day_start
+                if d_ret >= 0.12 or d_ret <= -0.09:
                     day_locked = True
 
-        if not day_locked and len(positions) < 2 and equity > 50:
-            for sym, max_lev in MAX_LEVERAGE.items():
-                if sym in positions or len(positions) >= 2:
+        # 2) 신규 진입 (동시 최대 2종목)
+        if not day_locked and equity > 50.0 and active.sum() < 2:
+            for c in range(4):
+                if active[c] or active.sum() >= 2:
                     continue
-                row = lookups[sym].get(dt)
-                if row is None:
-                    continue
-                sig = sig_fn(row)
-                if sig is not None:
-                    entry = row["close"]
-                    sl_dist = sl_mult * row[atr_col]
-                    tp_dist = tp_mult * row[atr_col]
-                    sl_pct = sl_dist / entry
+                sig = sig_mat[t, c]
+                if sig != 0:
+                    ent = close[t, c]
+                    sl_dist = sl_mult * atr[t, c]
+                    tp_dist = tp_mult * atr[t, c]
+                    sl_pct = sl_dist / ent
+                    if sl_pct <= 1e-6:
+                        continue
+                    notional = min((equity * risk_pct) / sl_pct, equity * MAX_LEV[c] * 0.5)
+                    efee = notional * FEE_RATE
+                    equity -= efee
 
-                    notional = min((equity * risk_per_trade) / sl_pct, equity * max_lev * 0.5)
-                    entry_fee = notional * FEE_RATE
-                    equity -= entry_fee
+                    active[c] = True
+                    p_side[c] = sig
+                    p_entry[c] = ent
+                    p_sl[c] = ent - sl_dist if sig == 1 else ent + sl_dist
+                    p_tp[c] = ent + tp_dist if sig == 1 else ent - tp_dist
+                    p_notional[c] = notional
+                    p_efee[c] = efee
+                    p_bars[c] = 0
 
-                    positions[sym] = {
-                        "side": sig,
-                        "entry": entry,
-                        "sl": entry - sl_dist if sig == "LONG" else entry + sl_dist,
-                        "tp": entry + tp_dist if sig == "LONG" else entry - tp_dist,
-                        "notional": notional,
-                        "entry_fee": entry_fee,
-                        "bars": 0,
-                    }
-
-    tdf = pd.DataFrame(trades)
-    if tdf.empty:
-        return {"trades": 0, "win_rate": 0.0, "ret_pct": 0.0, "mdd_pct": 0.0, "pf": 0.0}, tdf
-
-    win_rate = (tdf["pnl"] > 0).sum() / len(tdf) * 100
-    ret_pct = (equity - 1000.0) / 1000.0 * 100
-    gross_win = tdf.loc[tdf["pnl"] > 0, "pnl"].sum()
-    gross_loss = abs(tdf.loc[tdf["pnl"] <= 0, "pnl"].sum())
-    pf = round(gross_win / gross_loss, 2) if gross_loss > 0 else 99.0
+    total_trades = wins + losses
+    win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    ret_pct = (equity - 1000.0) / 1000.0 * 100.0
+    pf = (gross_win / gross_loss) if gross_loss > 0 else 99.0
 
     return {
-        "trades": len(tdf),
+        "trades": total_trades,
         "win_rate": round(win_rate, 2),
         "ret_pct": round(ret_pct, 2),
         "mdd_pct": round(max_dd, 2),
-        "pf": pf,
-    }, tdf
+        "pf": round(pf, 2),
+        "coin_wins": coin_wins,
+        "coin_losses": coin_losses,
+        "coin_pnl": coin_pnl,
+        "logs": trade_logs,
+    }
 
 
 def send_telegram(text):
@@ -306,38 +338,78 @@ def send_telegram(text):
 
 def main():
     exchange = ccxt.okx({"enableRateLimit": True})
-    raw_data = {sym: fetch_15m_ohlcv(exchange, sym, days=DAYS) for sym in MAX_LEVERAGE}
+    raw_data = {sym: fetch_15m_ohlcv(exchange, sym, days=DAYS) for sym in SYMBOLS}
 
-    btc_raw = raw_data["BTC/USDT:USDT"]
-    btc_1h = btc_raw.set_index("dt").resample("1h").agg({"close": "last"}).dropna()
-    btc_1h["btc_close_1h"] = btc_1h["close"]
-    btc_1h["btc_ema20_1h"] = btc_1h["close"].ewm(span=20, adjust=False).mean()
-    btc_1h_ref = btc_1h[["btc_close_1h", "btc_ema20_1h"]].shift(1).reset_index()
+    tp_sl_grid = [
+        (1.6, 2.2),
+        (1.8, 2.2),
+        (2.0, 2.4),
+        (2.2, 2.0),
+        (2.5, 2.5),
+        (3.0, 2.5),
+    ]
 
-    btc_4h = btc_raw.set_index("dt").resample("4h").agg({"close": "last"}).dropna()
-    btc_4h["btc_close_4h"] = btc_4h["close"]
-    btc_4h["btc_ema50_4h"] = btc_4h["close"].ewm(span=50, adjust=False).mean()
-    btc_4h_ref = btc_4h[["btc_close_4h", "btc_ema50_4h"]].shift(1).reset_index()
+    all_results = []
+    cache = {}
 
-    dfs_a, dfs_b = {}, {}
-    for sym in MAX_LEVERAGE:
-        d15, d1h = prepare_15m_and_1h(raw_data[sym], btc_1h_ref, btc_4h_ref)
-        dfs_a[sym] = d15
-        dfs_b[sym] = d1h
+    for tf in ["15m", "1h"]:
+        aligned, dts = build_features(raw_data, tf=tf)
+        high = np.column_stack([aligned[s]["high"].to_numpy() for s in SYMBOLS])
+        low = np.column_stack([aligned[s]["low"].to_numpy() for s in SYMBOLS])
+        close = np.column_stack([aligned[s]["close"].to_numpy() for s in SYMBOLS])
+        atr = np.column_stack([aligned[s]["atr"].to_numpy() for s in SYMBOLS])
+        day_arr = (dts.dt.dayofyear + dts.dt.year * 1000).to_numpy()
+        max_bars = 128 if tf == "15m" else 48
 
-    res_a, tdf_a = simulate_portfolio(dfs_a, sig_model_a, "atr14", sl_mult=2.8, tp_mult=2.6, max_bars=128, risk_per_trade=0.035)
-    res_b, tdf_b = simulate_portfolio(dfs_b, sig_model_b, "atr14_1h", sl_mult=2.5, tp_mult=2.5, max_bars=48, risk_per_trade=0.04)
+        presets = generate_signal_sets(aligned, tf)
+        for name, sig_mat in presets:
+            for tp_m, sl_m in tp_sl_grid:
+                res = fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_m, sl_m, max_bars)
+                res["name"] = f"{name} (TP {tp_m}/SL {sl_m})"
+                all_results.append(res)
+                cache[res["name"]] = (high, low, close, atr, day_arr, sig_mat, tp_m, sl_m, max_bars)
 
-    if not tdf_a.empty or not tdf_b.empty:
-        tdf_a["model"] = "A_15m_BB"
-        tdf_b["model"] = "B_1h_Swing"
-        pd.concat([tdf_a, tdf_b], ignore_index=True).to_csv("backtest_trades.csv", index=False)
+    res_df = pd.DataFrame([{k: v for k, v in r.items() if k not in ["coin_wins", "coin_losses", "coin_pnl", "logs"]} for r in all_results])
+    res_df = res_df.sort_values(by=["ret_pct", "win_rate"], ascending=False)
+    res_df.to_csv("optimization_results.csv", index=False)
 
-    msg = "\n".join([
-        f"📊 4종목 통합계좌 비교 결과 ({DAYS}일)",
-        f"▶ 모델A (15m BB반전): {res_a['trades']}회 | 승률 {res_a['win_rate']}% | 누적 {res_a['ret_pct']}% | MDD {res_a['mdd_pct']}% | PF {res_a['pf']}",
-        f"▶ 모델B (1H 스윙눌림): {res_b['trades']}회 | 승률 {res_b['win_rate']}% | 누적 {res_b['ret_pct']}% | MDD {res_b['mdd_pct']}% | PF {res_b['pf']}",
-    ])
+    # 승률 60% 이상 & 거래 30회 이상 필터링
+    qualified = [r for r in all_results if r["win_rate"] >= 60.0 and r["trades"] >= 30]
+    qualified.sort(key=lambda x: x["ret_pct"], reverse=True)
+
+    if not qualified:
+        qualified = [r for r in all_results if r["win_rate"] >= 58.0 and r["trades"] >= 20]
+        qualified.sort(key=lambda x: x["ret_pct"], reverse=True)
+
+    if not qualified:
+        qualified = sorted(all_results, key=lambda x: x["ret_pct"], reverse=True)
+
+    top3 = qualified[:3]
+    best = top3[0]
+
+    # 1위 전략 상세 로그 저장
+    h, l, c, a, d_arr, s_mat, tp_m, sl_m, m_bars = cache[best["name"]]
+    best_detail = fast_simulate(h, l, c, a, d_arr, s_mat, tp_m, sl_m, m_bars, record_trades=True)
+    pd.DataFrame(best_detail["logs"]).to_csv("backtest_trades.csv", index=False)
+
+    lines = [f"🏆 108개 전략 전수탐색 TOP 3 ({DAYS}일 통합계좌)"]
+    for idx, r in enumerate(top3, 1):
+        lines.append(
+            f"{idx}위: {r['name']}\n"
+            f"   ▶ {r['trades']}회 | 승률 {r['win_rate']}% | 누적 {r['ret_pct']}% | MDD {r['mdd_pct']}% | PF {r['pf']}"
+        )
+
+    lines.append("──────────────")
+    lines.append("📌 1위 전략 종목별 성과:")
+    for i, sym in enumerate(SYMBOLS):
+        w = best_detail["coin_wins"][i]
+        lo = best_detail["coin_losses"][i]
+        tot = w + lo
+        wr = round(w / tot * 100, 1) if tot > 0 else 0.0
+        pnl = round(best_detail["coin_pnl"][i], 1)
+        lines.append(f"- {sym.split('/')[0]}: {tot}회 (승률 {wr}%, 순손익 {pnl}$)")
+
+    msg = "\n".join(lines)
     print(msg)
     send_telegram(msg)
 
