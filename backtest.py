@@ -63,19 +63,7 @@ def calc_adx(df, period=14):
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def build_features(raw_data, tf="15m"):
-    # BTC 기준 상위 추세 생성
-    btc_raw = raw_data["BTC/USDT:USDT"]
-    btc_4h = btc_raw.set_index("dt").resample("4h").agg({"close": "last"}).dropna()
-    btc_4h["btc_c4"] = btc_4h["close"]
-    btc_4h["btc_e50_4"] = btc_4h["close"].ewm(span=50, adjust=False).mean()
-    btc_4h_ref = btc_4h[["btc_c4", "btc_e50_4"]].shift(1).reset_index()
-
-    btc_1h = btc_raw.set_index("dt").resample("1h").agg({"close": "last"}).dropna()
-    btc_1h["btc_c1"] = btc_1h["close"]
-    btc_1h["btc_e20_1"] = btc_1h["close"].ewm(span=20, adjust=False).mean()
-    btc_1h_ref = btc_1h[["btc_c1", "btc_e20_1"]].shift(1).reset_index()
-
+def build_1h_features(raw_data):
     dfs = {}
     for sym in SYMBOLS:
         raw = raw_data[sym]
@@ -96,110 +84,95 @@ def build_features(raw_data, tf="15m"):
             .dropna()
         )
         df_4h["c4"] = df_4h["close"]
-        df_4h["e20_4"] = df_4h["close"].ewm(span=20, adjust=False).mean()
         df_4h["e50_4"] = df_4h["close"].ewm(span=50, adjust=False).mean()
 
-        if tf == "15m":
-            df = raw.copy()
-            s_1h = df_1h[["e20_1", "e50_1", "adx_1"]].shift(1).reset_index()
-            s_4h = df_4h[["c4", "e20_4", "e50_4"]].shift(1).reset_index()
-            for ref in [s_1h, s_4h, btc_1h_ref, btc_4h_ref]:
-                df = pd.merge_asof(df.sort_values("dt"), ref.sort_values("dt"), on="dt", direction="backward")
-        else:
-            df = df_1h.reset_index()
-            s_4h = df_4h[["c4", "e20_4", "e50_4"]].shift(1).reset_index()
-            for ref in [s_4h, btc_1h_ref, btc_4h_ref]:
-                df = pd.merge_asof(df.sort_values("dt"), ref.sort_values("dt"), on="dt", direction="backward")
+        df = df_1h.reset_index()
+        s_4h = df_4h[["c4", "e50_4"]].shift(1).reset_index()
+        df = pd.merge_asof(df.sort_values("dt"), s_4h.sort_values("dt"), on="dt", direction="backward")
 
-        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-        bb_mid = df["close"].rolling(20).mean()
-        bb_std = df["close"].rolling(20).std()
-        df["bb_u"] = bb_mid + 2.0 * bb_std
-        df["bb_l"] = bb_mid - 2.0 * bb_std
+        df["ema20"] = df["e20_1"]
+        df["ema50"] = df["e50_1"]
         df["rsi"] = calc_rsi(df["close"], 14)
         df["atr"] = calc_atr(df, 14)
         df["atr_pct"] = df["atr"] / df["close"]
-        df["vol_ma"] = df["volume"].rolling(20).mean()
 
-        # 스토캐스틱 RSI (빠른 반전 포착용)
         rsi_min = df["rsi"].rolling(14).min()
         rsi_max = df["rsi"].rolling(14).max()
         df["stoch_k"] = ((df["rsi"] - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan) * 100).rolling(3).mean()
 
         dfs[sym] = df.dropna().reset_index(drop=True)
 
-    # 공통 타임라인 정렬
     common_dts = sorted(set.intersection(*(set(dfs[s]["dt"]) for s in SYMBOLS)))
     aligned = {s: dfs[s][dfs[s]["dt"].isin(common_dts)].sort_values("dt").reset_index(drop=True) for s in SYMBOLS}
     return aligned, pd.Series(common_dts)
 
 
-def generate_signal_sets(aligned, tf):
+def build_combo_matrices(aligned):
     n = len(next(iter(aligned.values())))
-    presets = []
+    sig1 = np.zeros((n, 4), dtype=np.int8)  # 1위: 1h EMA_StochRSI
+    sig2 = np.zeros((n, 4), dtype=np.int8)  # 2위: 1h Keltner_Pullback
 
-    trend_modes = ["BTC4H+Coin1H", "Strict_4H+1H", "Coin_Only"]
-    strat_modes = ["BB_Reversal", "EMA_StochRSI", "Keltner_Pullback"]
+    for c_idx, sym in enumerate(SYMBOLS):
+        df = aligned[sym]
+        vol_ok = df["atr_pct"] >= 0.0038
+        up_tr = (df["c4"] > df["e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 20)
+        dn_tr = (df["c4"] < df["e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 20)
 
-    for t_mode in trend_modes:
-        for s_mode in strat_modes:
-            sig_mat = np.zeros((n, 4), dtype=np.int8)
-            for c_idx, sym in enumerate(SYMBOLS):
-                df = aligned[sym]
-                min_atr = 0.0020 if tf == "15m" else 0.0038
-                vol_ok = df["atr_pct"] >= min_atr
+        # 1위 전략 신호
+        pull_l = (df["low"] <= df["ema20"]) & (df["close"] > df["ema50"])
+        st_l = (df["stoch_k"].shift(1) <= 25) & (df["stoch_k"] > df["stoch_k"].shift(1))
+        l1 = (vol_ok & up_tr & pull_l & st_l & (df["close"] > df["open"])).fillna(False).to_numpy()
 
-                if t_mode == "BTC4H+Coin1H":
-                    up_tr = (df["btc_c4"] > df["btc_e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 18)
-                    dn_tr = (df["btc_c4"] < df["btc_e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 18)
-                elif t_mode == "Strict_4H+1H":
-                    up_tr = (df["btc_c4"] > df["btc_e50_4"]) & (df["c4"] > df["e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 20)
-                    dn_tr = (df["btc_c4"] < df["btc_e50_4"]) & (df["c4"] < df["e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 20)
-                else:
-                    up_tr = (df["c4"] > df["e50_4"]) & (df["e20_1"] > df["e50_1"]) & (df["adx_1"] >= 20)
-                    dn_tr = (df["c4"] < df["e50_4"]) & (df["e20_1"] < df["e50_1"]) & (df["adx_1"] >= 20)
+        pull_s = (df["high"] >= df["ema20"]) & (df["close"] < df["ema50"])
+        st_s = (df["stoch_k"].shift(1) >= 75) & (df["stoch_k"] < df["stoch_k"].shift(1))
+        s1 = (vol_ok & dn_tr & pull_s & st_s & (df["close"] < df["open"])).fillna(False).to_numpy()
 
-                if s_mode == "BB_Reversal":
-                    touch_l = (df["low"] <= df["bb_l"]) | (df["low"].shift(1) <= df["bb_l"].shift(1))
-                    rsi_l = (df["rsi"].shift(1) <= 38) & (df["rsi"] > df["rsi"].shift(1))
-                    long_c = vol_ok & up_tr & touch_l & rsi_l & (df["close"] > df["open"])
+        sig1[l1, c_idx] = 1
+        sig1[s1 & (~l1), c_idx] = -1
 
-                    touch_s = (df["high"] >= df["bb_u"]) | (df["high"].shift(1) >= df["bb_u"].shift(1))
-                    rsi_s = (df["rsi"].shift(1) >= 62) & (df["rsi"] < df["rsi"].shift(1))
-                    short_c = vol_ok & dn_tr & touch_s & rsi_s & (df["close"] < df["open"])
+        # 2위 전략 신호
+        kc_l = df["ema20"] - 1.5 * df["atr"]
+        kc_u = df["ema20"] + 1.5 * df["atr"]
+        l2 = (vol_ok & up_tr & (df["low"] <= kc_l) & (df["close"] > df["open"]) & (df["rsi"] < 48)).fillna(False).to_numpy()
+        s2 = (vol_ok & dn_tr & (df["high"] >= kc_u) & (df["close"] < df["open"]) & (df["rsi"] > 52)).fillna(False).to_numpy()
 
-                elif s_mode == "EMA_StochRSI":
-                    pull_l = (df["low"] <= df["ema20"]) & (df["close"] > df["ema50"])
-                    st_l = (df["stoch_k"].shift(1) <= 25) & (df["stoch_k"] > df["stoch_k"].shift(1))
-                    long_c = vol_ok & up_tr & pull_l & st_l & (df["close"] > df["open"])
+        sig2[l2, c_idx] = 1
+        sig2[s2 & (~l2), c_idx] = -1
 
-                    pull_s = (df["high"] >= df["ema20"]) & (df["close"] < df["ema50"])
-                    st_s = (df["stoch_k"].shift(1) >= 75) & (df["stoch_k"] < df["stoch_k"].shift(1))
-                    short_c = vol_ok & dn_tr & pull_s & st_s & (df["close"] < df["open"])
+    # 조합 ①: 종목별 맞춤 배분 (BTC·ETH -> #2 [2.2/2.0], SOL·ADA -> #1 [2.5/2.5])
+    c1_sig = np.zeros((n, 4), dtype=np.int8)
+    c1_tp = np.zeros((n, 4))
+    c1_sl = np.zeros((n, 4))
+    c1_sig[:, :2] = sig2[:, :2]
+    c1_tp[:, :2] = 2.2
+    c1_sl[:, :2] = 2.0
+    c1_sig[:, 2:] = sig1[:, 2:]
+    c1_tp[:, 2:] = 2.5
+    c1_sl[:, 2:] = 2.5
 
-                else:  # Keltner_Pullback
-                    kc_l = df["ema20"] - 1.5 * df["atr"]
-                    kc_u = df["ema20"] + 1.5 * df["atr"]
-                    long_c = vol_ok & up_tr & (df["low"] <= kc_l) & (df["close"] > df["open"]) & (df["rsi"] < 48)
-                    short_c = vol_ok & dn_tr & (df["high"] >= kc_u) & (df["close"] < df["open"]) & (df["rsi"] > 52)
+    # 조합 ②: OR 병행 (#2 우선, 미발생 시 #1 적용) + 리스크 3.5%
+    c2_sig = np.where(sig2 != 0, sig2, sig1)
+    c2_tp = np.where(sig2 != 0, 2.2, 2.5)
+    c2_sl = np.where(sig2 != 0, 2.0, 2.5)
 
-                l_arr = long_c.fillna(False).to_numpy()
-                s_arr = short_c.fillna(False).to_numpy()
-                sig_mat[l_arr, c_idx] = 1
-                sig_mat[s_arr & (~l_arr), c_idx] = -1
+    # 조합 ③: AND 교집합 (두 신호 동시 일치 시 진입) + 리스크 5.5%
+    c3_sig = np.where((sig1 != 0) & (sig1 == sig2), sig1, 0)
+    c3_tp = np.full((n, 4), 2.35)
+    c3_sl = np.full((n, 4), 2.25)
 
-            presets.append((f"{tf}|{s_mode}|{t_mode}", sig_mat))
-    return presets
+    return [
+        ("조합① 종목맞춤 (BTC·ETH=#2 / SOL·ADA=#1)", c1_sig, c1_tp, c1_sl, 0.055),
+        ("조합② OR병행 + 리스크 3.5% 축소", c2_sig, c2_tp, c2_sl, 0.035),
+        ("조합③ AND교집합 (동시일치 진입)", c3_sig, c3_tp, c3_sl, 0.055),
+    ]
 
 
-def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max_bars, risk_pct=0.055, record_trades=False):
+def simulate_combo(high, low, close, atr, day_arr, sig_mat, tp_mat, sl_mat, risk_pct, record_trades=False):
     n = len(close)
     equity = 1000.0
     peak = 1000.0
     max_dd = 0.0
 
-    # 포지션 상태: active(bool), side(1/-1), entry, sl, tp, notional, entry_fee, bars
     active = np.zeros(4, dtype=bool)
     p_side = np.zeros(4, dtype=np.int8)
     p_entry = np.zeros(4)
@@ -229,7 +202,6 @@ def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max
             day_start = equity
             day_locked = False
 
-        # 1) 보유 포지션 청산 체크
         for c in range(4):
             if not active[c]:
                 continue
@@ -241,14 +213,14 @@ def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max
                     exit_p = p_sl[c]
                 elif high[t, c] >= p_tp[c]:
                     exit_p = p_tp[c]
-                elif p_bars[c] >= max_bars:
+                elif p_bars[c] >= 48:
                     exit_p = close[t, c]
             else:
                 if high[t, c] >= p_sl[c]:
                     exit_p = p_sl[c]
                 elif low[t, c] <= p_tp[c]:
                     exit_p = p_tp[c]
-                elif p_bars[c] >= max_bars:
+                elif p_bars[c] >= 48:
                     exit_p = close[t, c]
 
             if exit_p > 0.0:
@@ -270,7 +242,13 @@ def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max
                     gross_loss += abs(net)
 
                 if record_trades:
-                    trade_logs.append({"bar": t, "symbol": SYMBOLS[c], "side": "LONG" if s == 1 else "SHORT", "pnl": round(net, 2), "equity": round(equity, 2)})
+                    trade_logs.append({
+                        "bar": t,
+                        "symbol": SYMBOLS[c],
+                        "side": "LONG" if s == 1 else "SHORT",
+                        "pnl": round(net, 2),
+                        "equity": round(equity, 2),
+                    })
 
                 if equity > peak:
                     peak = equity
@@ -282,7 +260,6 @@ def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max
                 if d_ret >= 0.12 or d_ret <= -0.09:
                     day_locked = True
 
-        # 2) 신규 진입 (동시 최대 2종목)
         if not day_locked and equity > 50.0 and active.sum() < 2:
             for c in range(4):
                 if active[c] or active.sum() >= 2:
@@ -290,8 +267,8 @@ def fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_mult, sl_mult, max
                 sig = sig_mat[t, c]
                 if sig != 0:
                     ent = close[t, c]
-                    sl_dist = sl_mult * atr[t, c]
-                    tp_dist = tp_mult * atr[t, c]
+                    sl_dist = sl_mat[t, c] * atr[t, c]
+                    tp_dist = tp_mat[t, c] * atr[t, c]
                     sl_pct = sl_dist / ent
                     if sl_pct <= 1e-6:
                         continue
@@ -340,73 +317,40 @@ def main():
     exchange = ccxt.okx({"enableRateLimit": True})
     raw_data = {sym: fetch_15m_ohlcv(exchange, sym, days=DAYS) for sym in SYMBOLS}
 
-    tp_sl_grid = [
-        (1.6, 2.2),
-        (1.8, 2.2),
-        (2.0, 2.4),
-        (2.2, 2.0),
-        (2.5, 2.5),
-        (3.0, 2.5),
-    ]
+    aligned, dts = build_1h_features(raw_data)
+    high = np.column_stack([aligned[s]["high"].to_numpy() for s in SYMBOLS])
+    low = np.column_stack([aligned[s]["low"].to_numpy() for s in SYMBOLS])
+    close = np.column_stack([aligned[s]["close"].to_numpy() for s in SYMBOLS])
+    atr = np.column_stack([aligned[s]["atr"].to_numpy() for s in SYMBOLS])
+    day_arr = (dts.dt.dayofyear + dts.dt.year * 1000).to_numpy()
 
-    all_results = []
-    cache = {}
+    combos = build_combo_matrices(aligned)
+    results = []
 
-    for tf in ["15m", "1h"]:
-        aligned, dts = build_features(raw_data, tf=tf)
-        high = np.column_stack([aligned[s]["high"].to_numpy() for s in SYMBOLS])
-        low = np.column_stack([aligned[s]["low"].to_numpy() for s in SYMBOLS])
-        close = np.column_stack([aligned[s]["close"].to_numpy() for s in SYMBOLS])
-        atr = np.column_stack([aligned[s]["atr"].to_numpy() for s in SYMBOLS])
-        day_arr = (dts.dt.dayofyear + dts.dt.year * 1000).to_numpy()
-        max_bars = 128 if tf == "15m" else 48
+    for label, sig_m, tp_m, sl_m, r_pct in combos:
+        res = simulate_combo(high, low, close, atr, day_arr, sig_m, tp_m, sl_m, r_pct, record_trades=True)
+        res["label"] = label
+        results.append(res)
 
-        presets = generate_signal_sets(aligned, tf)
-        for name, sig_mat in presets:
-            for tp_m, sl_m in tp_sl_grid:
-                res = fast_simulate(high, low, close, atr, day_arr, sig_mat, tp_m, sl_m, max_bars)
-                res["name"] = f"{name} (TP {tp_m}/SL {sl_m})"
-                all_results.append(res)
-                cache[res["name"]] = (high, low, close, atr, day_arr, sig_mat, tp_m, sl_m, max_bars)
+    best = max(results, key=lambda x: x["ret_pct"])
+    if best["logs"]:
+        pd.DataFrame(best["logs"]).to_csv("backtest_trades.csv", index=False)
 
-    res_df = pd.DataFrame([{k: v for k, v in r.items() if k not in ["coin_wins", "coin_losses", "coin_pnl", "logs"]} for r in all_results])
-    res_df = res_df.sort_values(by=["ret_pct", "win_rate"], ascending=False)
-    res_df.to_csv("optimization_results.csv", index=False)
-
-    # 승률 60% 이상 & 거래 30회 이상 필터링
-    qualified = [r for r in all_results if r["win_rate"] >= 60.0 and r["trades"] >= 30]
-    qualified.sort(key=lambda x: x["ret_pct"], reverse=True)
-
-    if not qualified:
-        qualified = [r for r in all_results if r["win_rate"] >= 58.0 and r["trades"] >= 20]
-        qualified.sort(key=lambda x: x["ret_pct"], reverse=True)
-
-    if not qualified:
-        qualified = sorted(all_results, key=lambda x: x["ret_pct"], reverse=True)
-
-    top3 = qualified[:3]
-    best = top3[0]
-
-    # 1위 전략 상세 로그 저장
-    h, l, c, a, d_arr, s_mat, tp_m, sl_m, m_bars = cache[best["name"]]
-    best_detail = fast_simulate(h, l, c, a, d_arr, s_mat, tp_m, sl_m, m_bars, record_trades=True)
-    pd.DataFrame(best_detail["logs"]).to_csv("backtest_trades.csv", index=False)
-
-    lines = [f"🏆 108개 전략 전수탐색 TOP 3 ({DAYS}일 통합계좌)"]
-    for idx, r in enumerate(top3, 1):
+    lines = [f"🔀 1·2위 전략 3가지 조합 비교 ({DAYS}일 통합계좌)"]
+    for r in results:
         lines.append(
-            f"{idx}위: {r['name']}\n"
-            f"   ▶ {r['trades']}회 | 승률 {r['win_rate']}% | 누적 {r['ret_pct']}% | MDD {r['mdd_pct']}% | PF {r['pf']}"
+            f"▶ {r['label']}\n"
+            f"   {r['trades']}회 | 승률 {r['win_rate']}% | 누적 {r['ret_pct']}% | MDD {r['mdd_pct']}% | PF {r['pf']}"
         )
 
     lines.append("──────────────")
-    lines.append("📌 1위 전략 종목별 성과:")
+    lines.append(f"📌 최고 수익({best['label'].split()[0]}) 종목별 성과:")
     for i, sym in enumerate(SYMBOLS):
-        w = best_detail["coin_wins"][i]
-        lo = best_detail["coin_losses"][i]
+        w = best["coin_wins"][i]
+        lo = best["coin_losses"][i]
         tot = w + lo
         wr = round(w / tot * 100, 1) if tot > 0 else 0.0
-        pnl = round(best_detail["coin_pnl"][i], 1)
+        pnl = round(best["coin_pnl"][i], 1)
         lines.append(f"- {sym.split('/')[0]}: {tot}회 (승률 {wr}%, 순손익 {pnl}$)")
 
     msg = "\n".join(lines)
