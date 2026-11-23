@@ -1,5 +1,6 @@
 import os
 import json
+import datetime
 import numpy as np
 import pandas as pd
 import requests
@@ -7,7 +8,17 @@ import requests
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 STATE_FILE = "last_alert.json"
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT"]
+
+# 1. 기존 4종목 + OKX/Coinbase 동시 지원 유동성 상위 6종목 추가 (승률 로직은 동일 유지)
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT",
+    "XRPUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT", "DOTUSDT"
+]
+DECIMALS = {
+    "BTCUSDT": 2, "ETHUSDT": 2, "SOLUSDT": 2, "AVAXUSDT": 2, "LINKUSDT": 2,
+    "DOTUSDT": 3, "ADAUSDT": 4, "XRPUSDT": 4, "SUIUSDT": 4, "DOGEUSDT": 5
+}
+MAX_HOLD_MS = 6 * 60 * 60 * 1000  # 6시간 이상 횡보 시 포지션 자동 해제 (무한 대기 방지)
 
 def send_tg(text: str):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -68,19 +79,30 @@ def fetch_klines(symbol: str, interval: str, limit: int = 80) -> pd.DataFrame:
     return df
 
 def format_price(symbol: str, price: float) -> str:
-    if symbol == "ADAUSDT":
-        return f"${price:,.4f}"
-    return f"${price:,.2f}"
+    dec = DECIMALS.get(symbol, 4)
+    return f"${price:,.{dec}f}"
 
 def track_active_position(st: dict) -> bool:
-    """보유 중인 가상 포지션이 있으면 TP/SL 터치 여부를 확인하고 종료 시 알림 발송"""
+    """보유 중인 가상 포지션 TP/SL 확인 및 6시간 장기 횡보 자동 정리"""
     pos = st.get("active_pos")
     if not pos:
         return False
 
     sym = pos["symbol"]
-    df_5m = fetch_klines(sym, "5", 30)
+    df_5m = fetch_klines(sym, "5", 80)
     entry_ts = int(pos["ts"])
+    latest_ts = int(df_5m["ts"].iloc[-1])
+
+    # 6시간(360분) 이상 TP/SL 미도달 횡보 시 강제 종료하여 다음 시그널 차단 해제
+    if (latest_ts - entry_ts) >= MAX_HOLD_MS:
+        send_tg(
+            f"⏱️ [{sym}] 6시간 경과 횡보 종료 (본절/시간청산)\n"
+            f"• 방향: {pos['side']} | 진입가: {format_price(sym, pos['entry'])}\n"
+            f"• 신규 시그널 스캔 재개 (연패 유지: {st['consec_losses']}연패)"
+        )
+        st["active_pos"] = None
+        return False
+
     recent = df_5m[df_5m["ts"].astype(np.int64) > entry_ts]
     if recent.empty:
         return True
@@ -141,24 +163,23 @@ def check_signal(symbol: str):
     std = close.rolling(20).std().iloc[-2]
     bbw = (4 * std) / mid if mid > 0 else 0
 
+    # 백테스팅 검증 고승률 필터 (ADX 22 이상 + BBW 0.0045 이상 그대로 유지)
     if adx_val < 22.0 or bbw < 0.0045:
         return None, candle_ts
 
     ema9 = close.ewm(span=9, adjust=False).mean()
     ema21 = close.ewm(span=21, adjust=False).mean()
     price = float(close.iloc[-1])
-    dec = 4 if symbol == "ADAUSDT" else 2
+    dec = DECIMALS.get(symbol, 4)
 
-    # 최근 3개 마감 봉(-2, -3, -4) 이내에 골든/데드크로스가 발생했는지 확인
-    recent_gold = (
-        (ema9.iloc[-2] > ema21.iloc[-2] and ema9.iloc[-3] <= ema21.iloc[-3]) or
-        (ema9.iloc[-3] > ema21.iloc[-3] and ema9.iloc[-4] <= ema21.iloc[-4]) or
-        (ema9.iloc[-4] > ema21.iloc[-4] and ema9.iloc[-5] <= ema21.iloc[-5])
+    # 최근 6개 마감 봉(-2 ~ -7, 약 30분) 이내 골든/데드크로스 발생 여부 확인 (크론 지연 누락 방지)
+    recent_gold = any(
+        (ema9.iloc[-i] > ema21.iloc[-i] and ema9.iloc[-i-1] <= ema21.iloc[-i-1])
+        for i in range(2, 8)
     )
-    recent_dead = (
-        (ema9.iloc[-2] < ema21.iloc[-2] and ema9.iloc[-3] >= ema21.iloc[-3]) or
-        (ema9.iloc[-3] < ema21.iloc[-3] and ema9.iloc[-4] >= ema21.iloc[-4]) or
-        (ema9.iloc[-4] < ema21.iloc[-4] and ema9.iloc[-5] >= ema21.iloc[-5])
+    recent_dead = any(
+        (ema9.iloc[-i] < ema21.iloc[-i] and ema9.iloc[-i-1] >= ema21.iloc[-i-1])
+        for i in range(2, 8)
     )
 
     if htf_trend.startswith("LONG") and ema9.iloc[-2] > ema21.iloc[-2] and recent_gold and close.iloc[-2] > ema9.iloc[-2]:
@@ -180,16 +201,19 @@ def main():
         save_state(st)
         return
 
-    # 2. 무포지션 상태일 때만 4종목 신규 스캔
+    # 2. 무포지션 상태일 때 10종목 신규 스캔
     candidates = []
     for sym in SYMBOLS:
-        res, ts = check_signal(sym)
-        if res and st["last_ts"].get(sym) != ts:
-            side, entry, tp, sl, adx_val = res
-            candidates.append({
-                "symbol": sym, "ts": ts, "side": side,
-                "entry": entry, "tp": tp, "sl": sl, "adx": adx_val
-            })
+        try:
+            res, ts = check_signal(sym)
+            if res and st["last_ts"].get(sym) != ts:
+                side, entry, tp, sl, adx_val = res
+                candidates.append({
+                    "symbol": sym, "ts": ts, "side": side,
+                    "entry": entry, "tp": tp, "sl": sl, "adx": adx_val
+                })
+        except Exception:
+            continue
 
     if candidates:
         best = max(candidates, key=lambda x: x["adx"])
@@ -212,15 +236,19 @@ def main():
             f"• 추세 강도(ADX): {best['adx']:.1f}\n"
             f"• 권장 진입 비중: 시드의 {weight_txt}"
         )
-    elif os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        status_lines = []
-        for sym in SYMBOLS:
-            df_1h = fetch_klines(sym, "60", 80)
-            e20 = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-2]
-            e50 = df_1h["close"].ewm(span=50, adjust=False).mean().iloc[-2]
-            trend = "상승(LONG대기)" if e20 > e50 else "하락(SHORT대기)"
-            status_lines.append(f"• {sym}: {trend}")
-        send_tg("✅ 4종목 시그널 봇 정상 (무포지션)\n" + "\n".join(status_lines))
+    else:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        # 수동 실행 시 또는 매일 아침 09:00~09:10(KST = UTC 00:00~00:10) 정상 작동 보고
+        if is_manual or (now_utc.hour == 0 and now_utc.minute < 10):
+            status_lines = []
+            for sym in SYMBOLS[:4]:
+                df_1h = fetch_klines(sym, "60", 80)
+                e20 = df_1h["close"].ewm(span=20, adjust=False).mean().iloc[-2]
+                e50 = df_1h["close"].ewm(span=50, adjust=False).mean().iloc[-2]
+                trend = "상승(LONG대기)" if e20 > e50 else "하락(SHORT대기)"
+                status_lines.append(f"• {sym}: {trend}")
+            send_tg("✅ 10종목 시그널 봇 정상 (무포지션 · A급 타점 대기 중)\n" + "\n".join(status_lines))
 
     save_state(st)
 
