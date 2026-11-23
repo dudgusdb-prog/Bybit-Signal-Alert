@@ -4,13 +4,6 @@
     "BTCUSDT": "1795275900000",
     "ADAUSDT": "1795368000000"
   },
-  "active_pos": {
-    "symbol": "SOLUSDT",
-    "ts": "1795433700000",
-    "side": "LONG (\ucd94\uc138\uc720\uc9c0\u00b7\uc0c1\uc2b9\uc9c0\uc18d)",
-    "entry": 72.67,
-    "tp": 73.76,
-    "sl": 72.02
-  },
-  "consec_losses": 0
+  "active_pos": null,
+  "consec_losses": 1
 }
