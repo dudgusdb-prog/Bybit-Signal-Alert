@@ -72,8 +72,15 @@ def calc_adx(df, period=14):
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def format_price(p):
+    if p >= 1000:
+        return f"{p:,.1f}"
+    elif p >= 10:
+        return f"{p:,.2f}"
+    return f"{p:,.4f}"
+
+
 def fetch_and_prepare(exchange, symbol):
-    # GitHub Actions 미국 IP 차단을 피하기 위해 OKX 공개 1시간봉 300개 수집
     rows = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=300)
     df_1h = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df_1h = df_1h.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
@@ -83,7 +90,6 @@ def fetch_and_prepare(exchange, symbol):
     df_1h["e50_1"] = df_1h["close"].ewm(span=50, adjust=False).mean()
     df_1h["adx_1"] = calc_adx(df_1h, 14)
 
-    # 4시간봉 대추세 계산 (미래 참조 방지를 위해 직전 마감 4시간봉 기준)
     df_4h = (
         df_1h.set_index("dt")
         .resample("4h")
@@ -106,40 +112,59 @@ def fetch_and_prepare(exchange, symbol):
     return df.dropna().reset_index(drop=True)
 
 
-def evaluate_signal(df, cfg):
-    # iloc[-1]은 진행 중인 미마감 봉이므로 직전 마감 봉(iloc[-2]) 기준으로 판단
+def evaluate_signal(df, cfg, coin):
     if len(df) < 5:
-        return None
-    row = df.iloc[-2]
+        return None, f"- {coin}: 데이터 부족"
+
+    row = df.iloc[-2]  # 직전 마감 1시간봉 기준
     prev = df.iloc[-3]
+    price_str = format_price(float(row["close"]))
+    adx_val = float(row["adx_1"])
+    candle_dt = row["dt"].strftime("%Y-%m-%d %H:%M UTC")
 
-    if row["atr_pct"] < 0.0038:
-        return None
+    up_tr = (row["c4"] > row["e50_4"]) and (row["e20_1"] > row["e50_1"]) and (adx_val >= 20)
+    dn_tr = (row["c4"] < row["e50_4"]) and (row["e20_1"] < row["e50_1"]) and (adx_val >= 20)
 
-    up_tr = (row["c4"] > row["e50_4"]) and (row["e20_1"] > row["e50_1"]) and (row["adx_1"] >= 20)
-    dn_tr = (row["c4"] < row["e50_4"]) and (row["e20_1"] < row["e50_1"]) and (row["adx_1"] >= 20)
+    if up_tr:
+        trend_str = f"상승추세(ADX {adx_val:.1f})"
+    elif dn_tr:
+        trend_str = f"하락추세(ADX {adx_val:.1f})"
+    else:
+        trend_str = f"횡보/혼조(ADX {adx_val:.1f})"
 
     side = None
     if cfg["strategy"] == "KELTNER":
-        kc_l = row["e20_1"] - 1.5 * row["atr"]
-        kc_u = row["e20_1"] + 1.5 * row["atr"]
-        if up_tr and (row["low"] <= kc_l) and (row["close"] > row["open"]) and (row["rsi"] < 48):
-            side = "LONG"
-        elif dn_tr and (row["high"] >= kc_u) and (row["close"] < row["open"]) and (row["rsi"] > 52):
-            side = "SHORT"
-    else:  # EMA_STOCH
-        pull_l = (row["low"] <= row["e20_1"]) and (row["close"] > row["e50_1"])
-        st_l = (prev["stoch_k"] <= 25) and (row["stoch_k"] > prev["stoch_k"])
-        if up_tr and pull_l and st_l and (row["close"] > row["open"]):
-            side = "LONG"
-        else:
-            pull_s = (row["high"] >= row["e20_1"]) and (row["close"] < row["e50_1"])
-            st_s = (prev["stoch_k"] >= 75) and (row["stoch_k"] < prev["stoch_k"])
-            if dn_tr and pull_s and st_s and (row["close"] < row["open"]):
+        kc_l = float(row["e20_1"] - 1.5 * row["atr"])
+        kc_u = float(row["e20_1"] + 1.5 * row["atr"])
+        rsi_val = float(row["rsi"])
+        ind_str = f"RSI {rsi_val:.1f} | KC {format_price(kc_l)}~{format_price(kc_u)}"
+
+        if row["atr_pct"] >= 0.0038:
+            if up_tr and (row["low"] <= kc_l) and (row["close"] > row["open"]) and (rsi_val < 48):
+                side = "LONG"
+            elif dn_tr and (row["high"] >= kc_u) and (row["close"] < row["open"]) and (rsi_val > 52):
                 side = "SHORT"
+    else:
+        e20_val = float(row["e20_1"])
+        st_val = float(row["stoch_k"])
+        ind_str = f"StochK {st_val:.1f} | EMA20 {format_price(e20_val)}"
+
+        if row["atr_pct"] >= 0.0038:
+            pull_l = (row["low"] <= e20_val) and (row["close"] > row["e50_1"])
+            st_l = (prev["stoch_k"] <= 25) and (st_val > prev["stoch_k"])
+            if up_tr and pull_l and st_l and (row["close"] > row["open"]):
+                side = "LONG"
+            else:
+                pull_s = (row["high"] >= e20_val) and (row["close"] < row["e50_1"])
+                st_s = (prev["stoch_k"] >= 75) and (st_val < prev["stoch_k"])
+                if dn_tr and pull_s and st_s and (row["close"] < row["open"]):
+                    side = "SHORT"
+
+    state_tag = f"🚨 {side} 진입" if side else "⏳ 대기"
+    status_line = f"- {coin}: {price_str} | {trend_str} | {ind_str} → {state_tag}"
 
     if side is None:
-        return None
+        return None, status_line
 
     entry = float(row["close"])
     atr = float(row["atr"])
@@ -153,13 +178,12 @@ def evaluate_signal(df, cfg):
     tp_pct = tp_dist / entry
     max_lev = cfg["max_lev"]
 
-    # 전체 시드 대비 포지션 규모 배수 및 투입 증거금 비중(%) 계산
     notional_mult = min(RISK_PER_TRADE / sl_pct, max_lev * 0.5)
     margin_pct = (notional_mult / max_lev) * 100.0
 
     return {
         "candle_ts": int(row["ts"]),
-        "candle_dt": row["dt"].strftime("%Y-%m-%d %H:%M UTC"),
+        "candle_dt": candle_dt,
         "side": side,
         "entry": entry,
         "tp": tp_price,
@@ -169,7 +193,7 @@ def evaluate_signal(df, cfg):
         "max_lev": int(max_lev),
         "margin_pct": round(margin_pct, 1),
         "strategy": cfg["strategy"],
-    }
+    }, status_line
 
 
 def send_telegram(text):
@@ -182,33 +206,31 @@ def send_telegram(text):
     requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
 
 
-def format_price(p):
-    if p >= 1000:
-        return f"{p:,.1f}"
-    elif p >= 10:
-        return f"{p:,.2f}"
-    return f"{p:,.4f}"
-
-
 def main():
     exchange = ccxt.okx({"enableRateLimit": True})
     last_alerts = load_last_alerts()
     updated = False
+    is_manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+    status_lines = []
+    latest_dt = ""
 
     for sym, cfg in SYMBOLS.items():
+        coin = sym.split("/")[0]
         try:
             df = fetch_and_prepare(exchange, sym)
-            sig = evaluate_signal(df, cfg)
+            if len(df) >= 2:
+                latest_dt = df.iloc[-2]["dt"].strftime("%Y-%m-%d %H:%M UTC")
+            sig, status_line = evaluate_signal(df, cfg, coin)
+            status_lines.append(status_line)
             time.sleep(0.2)
 
             if sig is None:
                 continue
 
-            # 동일 캔들 중복 알림 방지
             if last_alerts.get(sym) == sig["candle_ts"]:
                 continue
 
-            coin = sym.split("/")[0]
             emoji = "🟢" if sig["side"] == "LONG" else "🔴"
             msg = (
                 f"{emoji} [{coin}USDT] {sig['side']} 진입 시그널\n"
@@ -225,7 +247,17 @@ def main():
             last_alerts[sym] = sig["candle_ts"]
             updated = True
         except Exception as e:
-            print(f"Error on {sym}: {e}")
+            err_line = f"- {coin}: 조회 오류 ({e})"
+            print(err_line)
+            status_lines.append(err_line)
+
+    if is_manual:
+        report = "\n".join([
+            f"🔍 [수동 실행 상태 점검] ({latest_dt} 마감봉)",
+            *status_lines,
+        ])
+        print(report)
+        send_telegram(report)
 
     if updated:
         save_last_alerts(last_alerts)
